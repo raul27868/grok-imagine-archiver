@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Grok Imagine - Archive media (anti-virtualization) + JSON/CSV export + ZIP base64 JPEG
 // @namespace    local.grok.archive
-// @version      1.4
+// @version      1.6
 // @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, and ZIP for data:image/jpeg;base64 images.
 // @match        https://grok.com/imagine*
 // @match        https://grok.com/imagine/favorites*
@@ -17,6 +17,12 @@
   const LIST_ID = "grok-archive-list";
   const STATUS_ID = "grok-archive-status";
   const KEY = "grok_archive_items_v1";
+  const POSITION_KEY = "grok_archive_panel_pos_v1";
+
+  // When false, the observer/scroll capture won't add new URLs.
+  // Used so "Clear" can truly empty the list without immediately re-adding
+  // the currently visible media from the page. Resume with "Rescan".
+  let captureEnabled = true;
 
   // Default filter tokens (comma-separated, OR logic)
   const DEFAULT_FILTER = "cdn-cgi";
@@ -45,6 +51,7 @@ function addDataJpegFromDataUrl(dataUrl) {
 }
 
 function collectDataJpegsFromNode(node) {
+  if (!captureEnabled) return 0;
   if (!node?.querySelectorAll) return 0;
   let added = 0;
   node.querySelectorAll("img").forEach(img => {
@@ -184,6 +191,7 @@ function updateZipButtonCounter() {
   }
 
   function addUrl(url) {
+    if (!captureEnabled) return false;
     if (!url) return false;
     if (items.has(url)) return false;
 
@@ -440,8 +448,20 @@ function captureVisibleMedia() {
       box-shadow: 0 8px 30px rgba(0,0,0,0.45);
     `;
 
+    // restore panel position (if user dragged it before)
+    try {
+      const saved = JSON.parse(localStorage.getItem(POSITION_KEY) || "null");
+      if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
+        panel.style.left = `${saved.left}px`;
+        panel.style.top = `${saved.top}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      }
+    } catch {}
+
+
     panel.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <div id="grok-arch-dragbar" title="Drag to move" style="display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:move;user-select:none;">
         <div style="display:flex;align-items:center;gap:10px;">
           <b>Archive</b>
           <span id="${STATUS_ID}" style="opacity:.8">${items.size} urls</span>
@@ -480,6 +500,62 @@ function captureVisibleMedia() {
 
     document.body.appendChild(panel);
 
+    // --- draggable panel (drag the top bar) ---
+    const dragBar = panel.querySelector("#grok-arch-dragbar");
+    if (dragBar) {
+      let dragging = false;
+      let startX = 0, startY = 0;
+      let startLeft = 0, startTop = 0;
+
+      const onMove = (ev) => {
+        if (!dragging) return;
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+
+        const nextLeft = Math.max(0, Math.min(window.innerWidth - 40, startLeft + dx));
+        const nextTop  = Math.max(0, Math.min(window.innerHeight - 40, startTop + dy));
+
+        panel.style.left = `${nextLeft}px`;
+        panel.style.top = `${nextTop}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+      };
+
+      const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        document.removeEventListener("mousemove", onMove, true);
+        document.removeEventListener("mouseup", onUp, true);
+
+        // persist last position
+        const left = parseFloat(panel.style.left) || 0;
+        const top = parseFloat(panel.style.top) || 0;
+        try { localStorage.setItem(POSITION_KEY, JSON.stringify({ left, top })); } catch {}
+      };
+
+      dragBar.addEventListener("mousedown", (ev) => {
+        // don't start drag when interacting with controls
+        if (ev.target?.closest?.("button,select,input,textarea,a")) return;
+
+        const rect = panel.getBoundingClientRect();
+        dragging = true;
+        startX = ev.clientX;
+        startY = ev.clientY;
+        startLeft = rect.left;
+        startTop = rect.top;
+
+        panel.style.left = `${startLeft}px`;
+        panel.style.top = `${startTop}px`;
+        panel.style.right = "auto";
+        panel.style.bottom = "auto";
+
+        document.addEventListener("mousemove", onMove, true);
+        document.addEventListener("mouseup", onUp, true);
+
+        ev.preventDefault();
+      }, true);
+    }
+
     // default filter
     const filterInput = panel.querySelector("#grok-arch-filter");
     if (filterInput && !filterInput.value) filterInput.value = DEFAULT_FILTER;
@@ -490,9 +566,24 @@ function captureVisibleMedia() {
     };
 
     panel.querySelector("#grok-arch-clear").onclick = () => {
+      // clear URL archive
       items.clear();
+      try { localStorage.removeItem(KEY); } catch {}
       persist();
-      panel.querySelector(`#${LIST_ID}`).innerHTML = "";
+
+      // clear base64 JPEG cache (ZIP)
+      dataJpegCache.clear();
+      dataJpegCountLastUI = 0;
+      updateZipButtonCounter();
+
+      // clear UI list
+      const list = panel.querySelector(`#${LIST_ID}`);
+      if (list) list.innerHTML = "";
+      renderList(panel);
+
+      // Pause capture so the list doesn't immediately repopulate
+      // from the already-visible content. User can resume with "Rescan".
+      captureEnabled = false;
     };
 
     panel.querySelector("#grok-arch-copy").onclick = async () => {
@@ -508,6 +599,8 @@ function captureVisibleMedia() {
     };
 
     panel.querySelector("#grok-arch-rescan").onclick = () => {
+      // Resume capture if it was paused by Clear
+      captureEnabled = true;
       const before = items.size;
       captureVisibleMedia();
       const after = items.size;
@@ -631,6 +724,7 @@ function captureVisibleMedia() {
     const target = pickBestContainer();
 
     const observer = new MutationObserver(mutations => {
+      if (!captureEnabled) return;
       let changed = false;
 
       for (const m of mutations) {
@@ -687,6 +781,7 @@ function captureVisibleMedia() {
 
   // Capture on manual scroll too
   const onScrollCapture = throttle(() => {
+    if (!captureEnabled) return;
     captureVisibleMedia();
     const panel = document.getElementById(ARCHIVE_ID);
     if (panel) renderList(panel);
