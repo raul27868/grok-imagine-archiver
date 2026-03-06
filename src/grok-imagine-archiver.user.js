@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Grok Imagine - Archive media (anti-virtualization) + JSON/CSV export + ZIP base64 JPEG
+// @name         Grok Imagine - Archive media (anti-virtualization) + JSON/CSV export + ZIP PNG + Parameters iTXt + prompt scrape fix
 // @namespace    local.grok.archive
-// @version      1.6
-// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, and ZIP for data:image/jpeg;base64 images.
+// @version      1.8.2
+// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, and ZIP for data:image/* images converted to PNG with Parameters metadata in iTXt UTF-8.
 // @match        https://grok.com/imagine*
 // @match        https://grok.com/imagine/favorites*
 // @run-at       document-idle
@@ -27,67 +27,154 @@
   // Default filter tokens (comma-separated, OR logic)
   const DEFAULT_FILTER = "cdn-cgi";
 
-  // Cache for base64 JPEGs seen over time (so virtualization doesn't lose them)
-const dataJpegCache = new Map(); // key -> { base64, ts }
-let dataJpegCountLastUI = 0;
+  // Cache for data:image/* seen over time (so virtualization doesn't lose them)
+  // key -> { dataUrl, mime, ts, parameters }
+  const dataImageCache = new Map();
+  let dataImageCountLastUI = 0;
 
-function makeDataKeyFromBase64(b64) {
-  // Dedup without heavy hashing: length + head/tail slices
-  const head = b64.slice(0, 32);
-  const tail = b64.slice(-32);
-  return `${b64.length}:${head}:${tail}`;
-}
+  // Debug logs for textarea scraping / Parameters building
+  const DEBUG_TEXTAREA_SCRAPE = true;
 
-function addDataJpegFromDataUrl(dataUrl) {
-  if (!dataUrl || !dataUrl.startsWith("data:image/jpeg;base64,")) return false;
-  const base64 = dataUrl.split(",", 2)[1] || "";
-  if (!base64) return false;
+  function makeDataKeyFromDataUrl(dataUrl) {
+    const head = dataUrl.slice(0, 64);
+    const tail = dataUrl.slice(-64);
+    return `${dataUrl.length}:${head}:${tail}`;
+  }
 
-  const key = makeDataKeyFromBase64(base64);
-  if (dataJpegCache.has(key)) return false;
+  function buildParametersText(rawText) {
+    const base = (rawText || "").trim();
+    const now = new Date();
+    const stamp = `Date: ${now.toISOString()} , Model:Grok`;
+    return base ? `${base}\n${stamp}` : stamp;
+  }
 
-  dataJpegCache.set(key, { base64, ts: Date.now() });
-  return true;
-}
+  function getParametersForImg(imgEl) {
+    try {
+      const section = imgEl?.closest?.('div[id^="imagine-masonry-section-"]');
+      const sectionId = section?.id || '(no section id)';
+      const src = imgEl?.currentSrc || imgEl?.src || '';
+      const srcPreview = src ? `${src.slice(0, 72)}... len=${src.length}` : '(no src)';
 
-function collectDataJpegsFromNode(node) {
-  if (!captureEnabled) return 0;
-  if (!node?.querySelectorAll) return 0;
-  let added = 0;
-  node.querySelectorAll("img").forEach(img => {
-    const src = img.currentSrc || img.src || "";
-    if (addDataJpegFromDataUrl(src)) added++;
-  });
-  return added;
-}
+      if (!section) {
+        if (DEBUG_TEXTAREA_SCRAPE) {
+          console.log('[grok.js][parameters] section not found for image:', { srcPreview });
+        }
+        return buildParametersText('');
+      }
 
-function updateZipButtonCounter() {
-  const btn = document.getElementById("grok-arch-zip");
-  if (!btn) return;
+      const normalize = (txt) => (txt || '').replace(/\s+/g, ' ').trim();
 
-  const n = dataJpegCache.size;
-  if (n === dataJpegCountLastUI) return;
-  dataJpegCountLastUI = n;
+      const selectors = [
+        'div.bg-surface-l1 span',
+        'div[class*="bg-surface-l1"] span',
+        'div.rounded-full span',
+        'div.sticky span',
+        'textarea',
+        '[data-testid*="prompt"]',
+        '[aria-label*="prompt" i]',
+        '[class*="prompt"]',
+        'span'
+      ];
 
-  // keep base label, add count
-  if (!btn.dataset.baseLabel) btn.dataset.baseLabel = btn.textContent.replace(/\s*\(\d+\)\s*$/, "");
-  btn.textContent = `${btn.dataset.baseLabel} (${n})`;
-}
+      let raw = '';
+      let chosenInfo = null;
+      const candidates = [];
+      const seen = new Set();
 
+      for (const selector of selectors) {
+        const nodes = [...section.querySelectorAll(selector)];
+        for (let i = 0; i < nodes.length; i++) {
+          const node = nodes[i];
+          if (seen.has(node)) continue;
+          seen.add(node);
 
+          const text = normalize(node instanceof HTMLTextAreaElement ? (node.value || node.textContent) : node.textContent);
+          const item = {
+            selector,
+            index: i,
+            tag: node.tagName,
+            text,
+            className: (node.className || '').toString().slice(0, 160)
+          };
+          candidates.push(item);
 
+          if (!raw && text) {
+            raw = text;
+            chosenInfo = item;
+          }
+        }
+        if (raw) break;
+      }
 
-  /**
-   * item = { url: string, uuid?: string, type?: "image"|"video"|"other", prompt?: string, ts?: number }
-   */
-  const stored = JSON.parse(localStorage.getItem(KEY) || "[]");
-  const items = new Map(); // url -> item
-  for (const it of stored) if (it?.url) items.set(it.url, it);
+      const finalText = buildParametersText(raw);
 
-  function persist() {
-    localStorage.setItem(KEY, JSON.stringify([...items.values()]));
-    const st = document.getElementById(STATUS_ID);
-    if (st) st.textContent = `${items.size} urls`;
+      if (DEBUG_TEXTAREA_SCRAPE) {
+        console.log('[grok.js][parameters] scrape result:', {
+          sectionId,
+          rawCapturedText: raw,
+          finalParameters: finalText,
+          chosenInfo,
+          candidates,
+          srcPreview,
+          sectionPreview: (section.outerHTML || '').slice(0, 1200)
+        });
+      }
+
+      return finalText;
+    } catch (err) {
+      if (DEBUG_TEXTAREA_SCRAPE) {
+        console.log('[grok.js][parameters] scrape error:', err);
+      }
+      return buildParametersText('');
+    }
+  }
+
+  function isSupportedDataImageUrl(src) {
+    return /^data:image\/(?:jpeg|jpg|png|webp);base64,/i.test(src || "");
+  }
+
+  function addDataImageFromImg(imgEl) {
+    if (!imgEl) return false;
+    const src = imgEl.currentSrc || imgEl.src || "";
+    if (!isSupportedDataImageUrl(src)) return false;
+
+    const key = makeDataKeyFromDataUrl(src);
+    const params = getParametersForImg(imgEl);
+    const mimeMatch = src.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,/i);
+    const mime = (mimeMatch?.[1] || "image/png").toLowerCase();
+
+    if (dataImageCache.has(key)) {
+      const entry = dataImageCache.get(key);
+      if (entry && (!entry.parameters || entry.parameters.trim().length === 0) && params) {
+        entry.parameters = params;
+      }
+      return false;
+    }
+
+    dataImageCache.set(key, { dataUrl: src, mime, ts: Date.now(), parameters: params });
+    return true;
+  }
+
+  function collectDataImagesFromNode(node) {
+    if (!captureEnabled) return 0;
+    if (!node?.querySelectorAll) return 0;
+    let added = 0;
+    node.querySelectorAll("img").forEach(img => {
+      if (addDataImageFromImg(img)) added++;
+    });
+    return added;
+  }
+
+  function updateZipButtonCounter() {
+    const btn = document.getElementById("grok-arch-zip");
+    if (!btn) return;
+
+    const n = dataImageCache.size;
+    if (n === dataImageCountLastUI) return;
+    dataImageCountLastUI = n;
+
+    if (!btn.dataset.baseLabel) btn.dataset.baseLabel = btn.textContent.replace(/\s*\(\d+\)\s*$/, "");
+    btn.textContent = `${btn.dataset.baseLabel} (${n})`;
   }
 
   function tsStamp() {
@@ -140,7 +227,7 @@ function updateZipButtonCounter() {
 
   function normalizeUrl(u) {
     try {
-      return new URL(u, location.href).toString(); // keep query
+      return new URL(u, location.href).toString();
     } catch {
       return null;
     }
@@ -190,6 +277,19 @@ function updateZipButtonCounter() {
       .filter(looksLikeMediaUrl);
   }
 
+  /**
+   * item = { url: string, uuid?: string, type?: "image"|"video"|"other", prompt?: string, ts?: number }
+   */
+  const stored = JSON.parse(localStorage.getItem(KEY) || "[]");
+  const items = new Map();
+  for (const it of stored) if (it?.url) items.set(it.url, it);
+
+  function persist() {
+    localStorage.setItem(KEY, JSON.stringify([...items.values()]));
+    const st = document.getElementById(STATUS_ID);
+    if (st) st.textContent = `${items.size} urls`;
+  }
+
   function addUrl(url) {
     if (!captureEnabled) return false;
     if (!url) return false;
@@ -200,12 +300,175 @@ function updateZipButtonCounter() {
       uuid: extractUuid(url) || undefined,
       type: inferType(url),
       ts: Date.now()
-      // prompt: (future)
     };
 
     items.set(url, item);
     persist();
     return true;
+  }
+
+  // PNG helpers ---------------------------------------------------------------
+
+  function crc32(bytes) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) {
+      crc ^= bytes[i];
+      for (let j = 0; j < 8; j++) {
+        const mask = -(crc & 1);
+        crc = (crc >>> 1) ^ (0xEDB88320 & mask);
+      }
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function uint32ToBytes(n) {
+    return new Uint8Array([
+      (n >>> 24) & 0xFF,
+      (n >>> 16) & 0xFF,
+      (n >>> 8) & 0xFF,
+      n & 0xFF
+    ]);
+  }
+
+  function concatUint8Arrays(arrays) {
+    const total = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const arr of arrays) {
+      out.set(arr, offset);
+      offset += arr.length;
+    }
+    return out;
+  }
+
+  function makePngChunk(type, dataBytes) {
+    const enc = new TextEncoder();
+    const typeBytes = enc.encode(type);
+    const lengthBytes = uint32ToBytes(dataBytes.length);
+    const crcBytes = uint32ToBytes(crc32(concatUint8Arrays([typeBytes, dataBytes])));
+    return concatUint8Arrays([lengthBytes, typeBytes, dataBytes, crcBytes]);
+  }
+
+  function makeITXtChunk(keyword, text) {
+    const enc = new TextEncoder();
+    const keywordBytes = enc.encode(keyword);
+    const textBytes = enc.encode(text);
+    const nul = new Uint8Array([0]);
+
+    // iTXt layout:
+    // keyword\0 compressionFlag compressionMethod languageTag\0 translatedKeyword\0 text(utf-8)
+    const payload = concatUint8Arrays([
+      keywordBytes,
+      nul,
+      new Uint8Array([0]), // compression flag: uncompressed
+      new Uint8Array([0]), // compression method
+      nul,                 // language tag
+      nul,                 // translated keyword
+      textBytes
+    ]);
+
+    return makePngChunk("iTXt", payload);
+  }
+
+  function injectITXtIntoPngBytes(pngBytes, keyword, text) {
+    const pngSigLength = 8;
+    const typeDecoder = new TextDecoder("latin1");
+    let offset = pngSigLength;
+    let insertAt = -1;
+    let iendStart = -1;
+
+    while (offset + 12 <= pngBytes.length) {
+      const length =
+        (pngBytes[offset] << 24) |
+        (pngBytes[offset + 1] << 16) |
+        (pngBytes[offset + 2] << 8) |
+        pngBytes[offset + 3];
+
+      const typeStart = offset + 4;
+      const dataStart = offset + 8;
+      const dataEnd = dataStart + length;
+      const crcEnd = dataEnd + 4;
+      if (crcEnd > pngBytes.length) throw new Error("Invalid PNG structure");
+
+      const chunkType = typeDecoder.decode(pngBytes.slice(typeStart, typeStart + 4));
+
+      if (chunkType === "IDAT" && insertAt === -1) insertAt = offset;
+      if (chunkType === "IEND") {
+        iendStart = offset;
+        break;
+      }
+
+      offset = crcEnd;
+    }
+
+    if (iendStart === -1) throw new Error("IEND chunk not found");
+    if (insertAt === -1) insertAt = iendStart;
+
+    const before = pngBytes.slice(0, insertAt);
+    const after = pngBytes.slice(insertAt);
+    const metaChunk = makeITXtChunk(keyword, text);
+
+    return concatUint8Arrays([before, metaChunk, after]);
+  }
+
+  function dataUrlToBlob(dataUrl) {
+    return fetch(dataUrl).then(res => res.blob());
+  }
+
+  function blobToUint8Array(blob) {
+    return blob.arrayBuffer().then(buf => new Uint8Array(buf));
+  }
+
+  function uint8ArrayToBlob(bytes, mime = "image/png") {
+    return new Blob([bytes], { type: mime });
+  }
+
+  async function renderDataUrlToPngBlob(dataUrl) {
+    const srcBlob = await dataUrlToBlob(dataUrl);
+
+    const bitmap = await createImageBitmap(srcBlob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+
+    const pngBlob = await new Promise((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (blob) resolve(blob);
+        else reject(new Error("PNG conversion failed"));
+      }, "image/png");
+    });
+
+    return pngBlob;
+  }
+
+  async function convertDataImageToPngWithParameters(dataUrl, parametersText) {
+    const pngBlob = await renderDataUrlToPngBlob(dataUrl);
+    const pngBytes = await blobToUint8Array(pngBlob);
+    const outBytes = injectITXtIntoPngBytes(pngBytes, "Parameters", parametersText || "");
+    return uint8ArrayToBlob(outBytes, "image/png");
+  }
+
+  function throttle(fn, waitMs) {
+    let last = 0;
+    let timer = null;
+    return (...args) => {
+      const now = Date.now();
+      const remaining = waitMs - (now - last);
+      if (remaining <= 0) {
+        last = now;
+        fn(...args);
+      } else if (!timer) {
+        timer = setTimeout(() => {
+          timer = null;
+          last = Date.now();
+          fn(...args);
+        }, remaining);
+      }
+    };
   }
 
   // Comma-separated filter tokens (OR logic)
@@ -234,22 +497,20 @@ function updateZipButtonCounter() {
   }
 
   // Capture media currently visible on screen (helps when no removedNodes yet)
-function captureVisibleMedia() {
-  const els = document.querySelectorAll("img, video");
-  for (const el of els) {
-    const container = el.closest?.("article, section, div") || el;
-    if (!isElementVisibleInViewport(container)) continue;
+  function captureVisibleMedia() {
+    const els = document.querySelectorAll("img, video");
+    for (const el of els) {
+      const container = el.closest?.("article, section, div") || el;
+      if (!isElementVisibleInViewport(container)) continue;
 
-    // existing URL capture
-    const urls = extractUrlsFromNode(container);
-    for (const u of urls) addUrl(u);
+      const urls = extractUrlsFromNode(container);
+      for (const u of urls) addUrl(u);
 
-    // NEW: base64 jpeg capture (for ZIP cache)
-    collectDataJpegsFromNode(container);
+      collectDataImagesFromNode(container);
+    }
+
+    updateZipButtonCounter();
   }
-
-  updateZipButtonCounter();
-}
 
   function renderList(panel) {
     const list = panel.querySelector(`#${LIST_ID}`);
@@ -307,127 +568,26 @@ function captureVisibleMedia() {
       });
   }
 
-  function throttle(fn, waitMs) {
-    let last = 0;
-    let timer = null;
-    return (...args) => {
-      const now = Date.now();
-      const remaining = waitMs - (now - last);
-      if (remaining <= 0) {
-        last = now;
-        fn(...args);
-      } else if (!timer) {
-        timer = setTimeout(() => {
-          timer = null;
-          last = Date.now();
-          fn(...args);
-        }, remaining);
-      }
-    };
-  }
+  async function buildZipFromCachedDataImages({ onProgress }) {
+    const JSZip = window.JSZip;
+    if (!JSZip) throw new Error("JSZip not loaded");
 
-  async function buildZipFromCachedDataJpegs({ onProgress }) {
-  const JSZip = window.JSZip;
-  if (!JSZip) throw new Error("JSZip not loaded");
-  const zip = new JSZip();
-
-  // dataJpegCache: Map(key -> { base64, ts })
-  const entries = [...dataJpegCache.values()]
-    .sort((a, b) => (a.ts || 0) - (b.ts || 0));  // opcional: orden por aparición
-
-  const total = entries.length;
-
-  for (let i = 0; i < total; i++) {
-    const { base64 } = entries[i];
-    const name = `image_${String(i + 1).padStart(4, "0")}.jpg`;
-
-    zip.file(name, base64, { base64: true });
-
-    if (onProgress) onProgress(i + 1, total);
-
-    // Evita congelar UI si hay muchas imágenes
-    if (i % 25 === 0) await new Promise(r => setTimeout(r, 0));
-  }
-
-  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-  return { blob, count: total };
-}
-
-
-
-  async function buildZipFromDataJpegs({ onProgress }) {
-    const JSZip = await ensureJSZip();
     const zip = new JSZip();
 
-  // --- JSZip loader (on demand) ---
-  function loadScriptOnce(src) {
-    return new Promise((resolve, reject) => {
-      const existing = document.querySelector(`script[data-grok-zip="1"][src="${src}"]`);
-      if (existing) {
-        existing.addEventListener("load", () => resolve());
-        existing.addEventListener("error", () => reject(new Error("Failed to load JSZip")));
-        // If already loaded, resolve quickly
-        if (window.JSZip) resolve();
-        return;
-      }
+    const entries = [...dataImageCache.values()]
+      .sort((a, b) => (a.ts || 0) - (b.ts || 0));
 
-      const s = document.createElement("script");
-      s.src = src;
-      s.async = true;
-      s.dataset.grokZip = "1";
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error("Failed to load JSZip"));
-      document.head.appendChild(s);
-    });
-  }
-
-  function ensureJSZip() {
-    if (window.JSZip) return Promise.resolve(window.JSZip);
-    if (!jszipPromise) {
-      jszipPromise = loadScriptOnce(JSZIP_CDN).then(() => {
-        if (!window.JSZip) throw new Error("JSZip loaded but not available");
-        return window.JSZip;
-      });
-    }
-    return jszipPromise;
-  }
-
-  // --- ZIP: capture data:image/jpeg;base64,... in current DOM ---
-  function collectBase64JpegsFromPage() {
-    const out = new Map(); // base64Payload -> { dataUrl, idx }
-    const imgs = document.querySelectorAll("img");
-
-    for (const img of imgs) {
-      const src = img.currentSrc || img.src || "";
-      if (!src.startsWith("data:image/jpeg;base64,")) continue;
-
-      // dedupe by base64 payload
-      const payload = src.split(",", 2)[1] || "";
-      if (!payload) continue;
-      if (!out.has(payload)) out.set(payload, { dataUrl: src });
-    }
-
-    return [...out.values()].map(x => x.dataUrl);
-  }
-
-
-    const dataUrls = collectBase64JpegsFromPage();
-    const total = dataUrls.length;
+    const total = entries.length;
 
     for (let i = 0; i < total; i++) {
-      const dataUrl = dataUrls[i];
-      const base64 = dataUrl.split(",", 2)[1] || "";
-
-      // name images sequentially
-      const name = `image_${String(i + 1).padStart(4, "0")}.jpg`;
-
-      // JSZip can take base64 directly
-      zip.file(name, base64, { base64: true });
+      const { dataUrl, parameters } = entries[i];
+      const pngBlob = await convertDataImageToPngWithParameters(dataUrl, parameters || "");
+      const name = `image_${String(i + 1).padStart(4, "0")}.png`;
+      zip.file(name, pngBlob);
 
       if (onProgress) onProgress(i + 1, total);
 
-      // yield to UI every so often to avoid freezing
-      if (i % 25 === 0) await new Promise(r => setTimeout(r, 0));
+      if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
     const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
@@ -448,7 +608,6 @@ function captureVisibleMedia() {
       box-shadow: 0 8px 30px rgba(0,0,0,0.45);
     `;
 
-    // restore panel position (if user dragged it before)
     try {
       const saved = JSON.parse(localStorage.getItem(POSITION_KEY) || "null");
       if (saved && Number.isFinite(saved.left) && Number.isFinite(saved.top)) {
@@ -458,7 +617,6 @@ function captureVisibleMedia() {
         panel.style.bottom = "auto";
       }
     } catch {}
-
 
     panel.innerHTML = `
       <div id="grok-arch-dragbar" title="Drag to move" style="display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:move;user-select:none;">
@@ -477,7 +635,7 @@ function captureVisibleMedia() {
           <button id="grok-arch-export" style="cursor:pointer;">Export</button>
           <button id="grok-arch-copy" style="cursor:pointer;">Copy URLs</button>
           <button id="grok-arch-rescan" style="cursor:pointer;">Rescan</button>
-          <button id="grok-arch-zip" style="cursor:pointer;">ZIP (data:jpeg)</button>
+          <button id="grok-arch-zip" style="cursor:pointer;">ZIP (PNG+Parameters)</button>
           <button id="grok-arch-scroll" style="cursor:pointer;">Auto-scroll</button>
           <button id="grok-arch-clear" style="cursor:pointer;">Clear</button>
           <button id="grok-arch-hide" style="cursor:pointer;">Hide</button>
@@ -500,7 +658,6 @@ function captureVisibleMedia() {
 
     document.body.appendChild(panel);
 
-    // --- draggable panel (drag the top bar) ---
     const dragBar = panel.querySelector("#grok-arch-dragbar");
     if (dragBar) {
       let dragging = false;
@@ -527,14 +684,12 @@ function captureVisibleMedia() {
         document.removeEventListener("mousemove", onMove, true);
         document.removeEventListener("mouseup", onUp, true);
 
-        // persist last position
         const left = parseFloat(panel.style.left) || 0;
         const top = parseFloat(panel.style.top) || 0;
         try { localStorage.setItem(POSITION_KEY, JSON.stringify({ left, top })); } catch {}
       };
 
       dragBar.addEventListener("mousedown", (ev) => {
-        // don't start drag when interacting with controls
         if (ev.target?.closest?.("button,select,input,textarea,a")) return;
 
         const rect = panel.getBoundingClientRect();
@@ -556,7 +711,6 @@ function captureVisibleMedia() {
       }, true);
     }
 
-    // default filter
     const filterInput = panel.querySelector("#grok-arch-filter");
     if (filterInput && !filterInput.value) filterInput.value = DEFAULT_FILTER;
 
@@ -566,23 +720,18 @@ function captureVisibleMedia() {
     };
 
     panel.querySelector("#grok-arch-clear").onclick = () => {
-      // clear URL archive
       items.clear();
       try { localStorage.removeItem(KEY); } catch {}
       persist();
 
-      // clear base64 JPEG cache (ZIP)
-      dataJpegCache.clear();
-      dataJpegCountLastUI = 0;
+      dataImageCache.clear();
+      dataImageCountLastUI = 0;
       updateZipButtonCounter();
 
-      // clear UI list
       const list = panel.querySelector(`#${LIST_ID}`);
       if (list) list.innerHTML = "";
       renderList(panel);
 
-      // Pause capture so the list doesn't immediately repopulate
-      // from the already-visible content. User can resume with "Rescan".
       captureEnabled = false;
     };
 
@@ -599,7 +748,6 @@ function captureVisibleMedia() {
     };
 
     panel.querySelector("#grok-arch-rescan").onclick = () => {
-      // Resume capture if it was paused by Clear
       captureEnabled = true;
       const before = items.size;
       captureVisibleMedia();
@@ -612,7 +760,6 @@ function captureVisibleMedia() {
       renderList(panel);
     };
 
-    // NEW: ZIP button (data:image/jpeg;base64,...)
     panel.querySelector("#grok-arch-zip").onclick = async () => {
       const btn = panel.querySelector("#grok-arch-zip");
       const original = btn.textContent;
@@ -621,11 +768,11 @@ function captureVisibleMedia() {
         btn.disabled = true;
         btn.textContent = "Scanning…";
 
-        const { blob, count } = await buildZipFromCachedDataJpegs({
-            onProgress: (done, total) => {
-              btn.textContent = `ZIP ${done}/${total}`;
-            }
-          });
+        const { blob, count } = await buildZipFromCachedDataImages({
+          onProgress: (done, total) => {
+            btn.textContent = `ZIP ${done}/${total}`;
+          }
+        });
 
         if (count === 0) {
           btn.textContent = "ZIP (0 found)";
@@ -634,7 +781,7 @@ function captureVisibleMedia() {
         }
 
         btn.textContent = "Downloading…";
-        downloadBlob(blob, `grok-imagine-datajpeg-${tsStamp()}.zip`);
+        downloadBlob(blob, `grok-imagine-png-parameters-${tsStamp()}.zip`);
 
         btn.textContent = `ZIP done (${count})`;
         setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1400);
@@ -645,7 +792,6 @@ function captureVisibleMedia() {
       }
     };
 
-    // Auto-scroll (scroll actual scrollable container, not always window)
     let scrollTimer = null;
 
     function getScrollableEl() {
@@ -704,7 +850,6 @@ function captureVisibleMedia() {
   }
 
   function pickBestContainer() {
-    // Heuristic: big scrollHeight + many children
     const candidates = [...document.querySelectorAll("main, [role='main'], body, div")]
       .filter(el => el && el.nodeType === 1)
       .map(el => ({
@@ -728,7 +873,6 @@ function captureVisibleMedia() {
       let changed = false;
 
       for (const m of mutations) {
-        // IMPORTANT: capture attribute changes (DOM recycling / virtualization)
         if (m.type === "attributes" && m.target && m.target.nodeType === 1) {
           const el = m.target;
           const scope = el.closest?.("article, section, div") || el;
@@ -736,8 +880,7 @@ function captureVisibleMedia() {
           const urls = extractUrlsFromNode(scope);
           for (const u of urls) if (addUrl(u)) changed = true;
 
-          // NEW
-          collectDataJpegsFromNode(scope);
+          collectDataImagesFromNode(scope);
           continue;
         }
 
@@ -747,8 +890,7 @@ function captureVisibleMedia() {
           const urls = extractUrlsFromNode(node);
           for (const u of urls) if (addUrl(u)) changed = true;
 
-          // NEW
-          collectDataJpegsFromNode(node);
+          collectDataImagesFromNode(node);
         }
 
         for (const node of m.addedNodes || []) {
@@ -757,8 +899,7 @@ function captureVisibleMedia() {
           const urls = extractUrlsFromNode(node);
           for (const u of urls) if (addUrl(u)) changed = true;
 
-          // NEW
-          collectDataJpegsFromNode(node);
+          collectDataImagesFromNode(node);
         }
       }
 
@@ -779,7 +920,6 @@ function captureVisibleMedia() {
     renderList(panel);
   }
 
-  // Capture on manual scroll too
   const onScrollCapture = throttle(() => {
     if (!captureEnabled) return;
     captureVisibleMedia();
@@ -789,6 +929,5 @@ function captureVisibleMedia() {
 
   window.addEventListener("scroll", onScrollCapture, { passive: true, capture: true });
 
-  // Start
   startObserver();
 })();
