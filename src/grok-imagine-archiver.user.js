@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine - Archive media (anti-virtualization) + JSON/CSV export + ZIP PNG + Parameters iTXt + prompt scrape fix
 // @namespace    local.grok.archive
-// @version      1.8.2
-// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, and ZIP for data:image/* images converted to PNG with Parameters metadata in iTXt UTF-8.
+// @version      1.8.3
+// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, go-to-top button, and ZIP for data:image/* images converted to PNG with Parameters metadata in iTXt UTF-8.
 // @match        https://grok.com/imagine*
 // @match        https://grok.com/imagine/favorites*
 // @run-at       document-idle
@@ -165,12 +165,12 @@
     return added;
   }
 
-  function updateZipButtonCounter() {
+  function updateZipButtonCounter(force = false) {
     const btn = document.getElementById("grok-arch-zip");
     if (!btn) return;
 
     const n = dataImageCache.size;
-    if (n === dataImageCountLastUI) return;
+    if (!force && n === dataImageCountLastUI) return;
     dataImageCountLastUI = n;
 
     if (!btn.dataset.baseLabel) btn.dataset.baseLabel = btn.textContent.replace(/\s*\(\d+\)\s*$/, "");
@@ -636,6 +636,7 @@
           <button id="grok-arch-copy" style="cursor:pointer;">Copy URLs</button>
           <button id="grok-arch-rescan" style="cursor:pointer;">Rescan</button>
           <button id="grok-arch-zip" style="cursor:pointer;">ZIP (PNG+Parameters)</button>
+          <button id="grok-arch-top" style="cursor:pointer;">Top</button>
           <button id="grok-arch-scroll" style="cursor:pointer;">Auto-scroll</button>
           <button id="grok-arch-clear" style="cursor:pointer;">Clear</button>
           <button id="grok-arch-hide" style="cursor:pointer;">Hide</button>
@@ -725,14 +726,24 @@
       persist();
 
       dataImageCache.clear();
-      dataImageCountLastUI = 0;
-      updateZipButtonCounter();
+      dataImageCountLastUI = -1;
+      updateZipButtonCounter(true);
 
       const list = panel.querySelector(`#${LIST_ID}`);
       if (list) list.innerHTML = "";
       renderList(panel);
 
       captureEnabled = false;
+    };
+
+    panel.querySelector("#grok-arch-top").onclick = () => {
+      const el = getScrollableEl();
+
+      if (el === document.scrollingElement || el === document.documentElement || el === document.body) {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      } else {
+        el.scrollTo({ top: 0, behavior: "smooth" });
+      }
     };
 
     panel.querySelector("#grok-arch-copy").onclick = async () => {
