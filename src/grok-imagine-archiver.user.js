@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Grok Imagine - Archive media (anti-virtualization) + JSON/CSV export + ZIP PNG + Parameters iTXt + prompt scrape fix
 // @namespace    local.grok.archive
-// @version      1.8.3
-// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, go-to-top button, and ZIP for data:image/* images converted to PNG with Parameters metadata in iTXt UTF-8.
+// @version      1.9.1
+// @description  Capture image/video URLs from grok.com/imagine (including recycled DOM/virtualization) and export JSON/CSV. Includes default filter, rescan, go-to-top button, ZIP for captured images/videos, PNG Parameters iTXt, and auto short title from prompt.
 // @match        https://grok.com/imagine*
 // @match        https://grok.com/imagine/favorites*
 // @run-at       document-idle
@@ -19,26 +19,40 @@
   const KEY = "grok_archive_items_v1";
   const POSITION_KEY = "grok_archive_panel_pos_v1";
 
-  // When false, the observer/scroll capture won't add new URLs.
-  // Used so "Clear" can truly empty the list without immediately re-adding
-  // the currently visible media from the page. Resume with "Rescan".
   let captureEnabled = true;
-
-  // Default filter tokens (comma-separated, OR logic)
   const DEFAULT_FILTER = "cdn-cgi";
 
-  // Cache for data:image/* seen over time (so virtualization doesn't lose them)
-  // key -> { dataUrl, mime, ts, parameters }
   const dataImageCache = new Map();
+  const videoCache = new Map();
   let dataImageCountLastUI = 0;
 
-  // Debug logs for textarea scraping / Parameters building
   const DEBUG_TEXTAREA_SCRAPE = true;
 
   function makeDataKeyFromDataUrl(dataUrl) {
     const head = dataUrl.slice(0, 64);
     const tail = dataUrl.slice(-64);
     return `${dataUrl.length}:${head}:${tail}`;
+  }
+
+  function normalizePromptText(txt) {
+    return (txt || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function slugifyTitleFromPrompt(promptText) {
+    const raw = normalizePromptText(promptText)
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 20)
+      .replace(/-+$/g, '');
+
+    return raw || 'capture';
+  }
+
+  function buildZipFilename(titleText) {
+    return `grok-${slugifyTitleFromPrompt(titleText)}-${tsStamp()}.zip`;
   }
 
   function buildParametersText(rawText) {
@@ -48,29 +62,29 @@
     return base ? `${base}\n${stamp}` : stamp;
   }
 
-  function getParametersForImg(imgEl) {
+  function getPromptTextForMedia(mediaEl) {
     try {
-      const section = imgEl?.closest?.('div[id^="imagine-masonry-section-"]');
+      const section = mediaEl?.closest?.('div[id^="imagine-masonry-section-"]') ||
+                      mediaEl?.closest?.('article, section, [data-testid], div');
       const sectionId = section?.id || '(no section id)';
-      const src = imgEl?.currentSrc || imgEl?.src || '';
+      const src = mediaEl?.currentSrc || mediaEl?.src || '';
       const srcPreview = src ? `${src.slice(0, 72)}... len=${src.length}` : '(no src)';
 
       if (!section) {
         if (DEBUG_TEXTAREA_SCRAPE) {
-          console.log('[grok.js][parameters] section not found for image:', { srcPreview });
+          console.log('[grok.js][prompt] section not found for media:', { srcPreview });
         }
-        return buildParametersText('');
+        return '';
       }
 
-      const normalize = (txt) => (txt || '').replace(/\s+/g, ' ').trim();
-
       const selectors = [
+        '[data-testid*="prompt"]',
+        'textarea[data-testid]',
+        'textarea',
         'div.bg-surface-l1 span',
         'div[class*="bg-surface-l1"] span',
         'div.rounded-full span',
         'div.sticky span',
-        'textarea',
-        '[data-testid*="prompt"]',
         '[aria-label*="prompt" i]',
         '[class*="prompt"]',
         'span'
@@ -88,11 +102,12 @@
           if (seen.has(node)) continue;
           seen.add(node);
 
-          const text = normalize(node instanceof HTMLTextAreaElement ? (node.value || node.textContent) : node.textContent);
+          const text = normalizePromptText(node instanceof HTMLTextAreaElement ? (node.value || node.textContent) : node.textContent);
           const item = {
             selector,
             index: i,
             tag: node.tagName,
+            testid: node.getAttribute?.('data-testid') || '',
             text,
             className: (node.className || '').toString().slice(0, 160)
           };
@@ -106,13 +121,10 @@
         if (raw) break;
       }
 
-      const finalText = buildParametersText(raw);
-
       if (DEBUG_TEXTAREA_SCRAPE) {
-        console.log('[grok.js][parameters] scrape result:', {
+        console.log('[grok.js][prompt] scrape result:', {
           sectionId,
           rawCapturedText: raw,
-          finalParameters: finalText,
           chosenInfo,
           candidates,
           srcPreview,
@@ -120,13 +132,32 @@
         });
       }
 
-      return finalText;
+      return raw;
     } catch (err) {
       if (DEBUG_TEXTAREA_SCRAPE) {
-        console.log('[grok.js][parameters] scrape error:', err);
+        console.log('[grok.js][prompt] scrape error:', err);
       }
-      return buildParametersText('');
+      return '';
     }
+  }
+
+  function getParametersForImg(imgEl) {
+    return buildParametersText(getPromptTextForMedia(imgEl));
+  }
+
+  function getShortTitleFromCaches() {
+    const mediaEntries = [
+      ...videoCache.values(),
+      ...dataImageCache.values(),
+      ...items.values()
+    ]
+      .filter(entry => normalizePromptText(entry?.prompt || entry?.parameters || ''))
+      .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+
+    if (!mediaEntries.length) return 'capture';
+
+    const prompt = mediaEntries[0].prompt || mediaEntries[0].parameters || '';
+    return slugifyTitleFromPrompt(prompt);
   }
 
   function isSupportedDataImageUrl(src) {
@@ -139,7 +170,8 @@
     if (!isSupportedDataImageUrl(src)) return false;
 
     const key = makeDataKeyFromDataUrl(src);
-    const params = getParametersForImg(imgEl);
+    const prompt = getPromptTextForMedia(imgEl);
+    const params = buildParametersText(prompt);
     const mimeMatch = src.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,/i);
     const mime = (mimeMatch?.[1] || "image/png").toLowerCase();
 
@@ -148,10 +180,42 @@
       if (entry && (!entry.parameters || entry.parameters.trim().length === 0) && params) {
         entry.parameters = params;
       }
+      if (entry && (!entry.prompt || entry.prompt.trim().length === 0) && prompt) {
+        entry.prompt = prompt;
+      }
       return false;
     }
 
-    dataImageCache.set(key, { dataUrl: src, mime, ts: Date.now(), parameters: params });
+    dataImageCache.set(key, { dataUrl: src, mime, ts: Date.now(), prompt, parameters: params });
+    return true;
+  }
+
+  function isSupportedVideoUrl(src) {
+    return /\.(?:mp4|webm|mov|m4v)(?:\?|$)/i.test(src || '') || /\/videos?\b/i.test(src || '');
+  }
+
+  function addVideoFromEl(videoEl) {
+    if (!videoEl) return false;
+    const src = videoEl.currentSrc || videoEl.src || videoEl.querySelector?.('source')?.src || '';
+    if (!src || !isSupportedVideoUrl(src)) return false;
+
+    const url = normalizeUrl(src);
+    if (!url) return false;
+
+    const prompt = getPromptTextForMedia(videoEl);
+
+    if (videoCache.has(url)) {
+      const entry = videoCache.get(url);
+      if (entry && (!entry.prompt || entry.prompt.trim().length === 0) && prompt) {
+        entry.prompt = prompt;
+      }
+      if (entry && !entry.videoEl && videoEl) {
+        entry.videoEl = videoEl;
+      }
+      return false;
+    }
+
+    videoCache.set(url, { url, ts: Date.now(), prompt, type: 'video', videoEl });
     return true;
   }
 
@@ -162,6 +226,11 @@
     node.querySelectorAll("img").forEach(img => {
       if (addDataImageFromImg(img)) added++;
     });
+    node.querySelectorAll("video").forEach(video => {
+      if (addVideoFromEl(video)) added++;
+    });
+    if (node.matches?.("video") && addVideoFromEl(node)) added++;
+    if (node.matches?.("img") && addDataImageFromImg(node)) added++;
     return added;
   }
 
@@ -169,7 +238,7 @@
     const btn = document.getElementById("grok-arch-zip");
     if (!btn) return;
 
-    const n = dataImageCache.size;
+    const n = dataImageCache.size + videoCache.size;
     if (!force && n === dataImageCountLastUI) return;
     dataImageCountLastUI = n;
 
@@ -221,7 +290,7 @@
   }
 
   function looksLikeMediaUrl(url) {
-    return /\.(png|jpe?g|webp|gif|mp4|webm)(\?|$)/i.test(url) ||
+    return /\.(png|jpe?g|webp|gif|mp4|webm|mov|m4v)(\?|$)/i.test(url) ||
            /\/(image|images|video|videos)\b/i.test(url);
   }
 
@@ -234,7 +303,7 @@
   }
 
   function inferType(url) {
-    if (/\.(mp4|webm)(\?|$)/i.test(url)) return "video";
+    if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(url)) return "video";
     if (/\.(png|jpe?g|webp|gif)(\?|$)/i.test(url)) return "image";
     return "other";
   }
@@ -258,7 +327,6 @@
     node.querySelectorAll?.("video").forEach(v => {
       if (v.currentSrc) urls.add(v.currentSrc);
       if (v.src) urls.add(v.src);
-      if (v.poster) urls.add(v.poster);
       v.querySelectorAll("source").forEach(s => s.src && urls.add(s.src));
     });
 
@@ -277,9 +345,6 @@
       .filter(looksLikeMediaUrl);
   }
 
-  /**
-   * item = { url: string, uuid?: string, type?: "image"|"video"|"other", prompt?: string, ts?: number }
-   */
   const stored = JSON.parse(localStorage.getItem(KEY) || "[]");
   const items = new Map();
   for (const it of stored) if (it?.url) items.set(it.url, it);
@@ -290,7 +355,7 @@
     if (st) st.textContent = `${items.size} urls`;
   }
 
-  function addUrl(url) {
+  function addUrl(url, contextEl = null) {
     if (!captureEnabled) return false;
     if (!url) return false;
     if (items.has(url)) return false;
@@ -299,15 +364,14 @@
       url,
       uuid: extractUuid(url) || undefined,
       type: inferType(url),
-      ts: Date.now()
+      ts: Date.now(),
+      prompt: getPromptTextForMedia(contextEl) || undefined
     };
 
     items.set(url, item);
     persist();
     return true;
   }
-
-  // PNG helpers ---------------------------------------------------------------
 
   function crc32(bytes) {
     let crc = 0xFFFFFFFF;
@@ -355,15 +419,13 @@
     const textBytes = enc.encode(text);
     const nul = new Uint8Array([0]);
 
-    // iTXt layout:
-    // keyword\0 compressionFlag compressionMethod languageTag\0 translatedKeyword\0 text(utf-8)
     const payload = concatUint8Arrays([
       keywordBytes,
       nul,
-      new Uint8Array([0]), // compression flag: uncompressed
-      new Uint8Array([0]), // compression method
-      nul,                 // language tag
-      nul,                 // translated keyword
+      new Uint8Array([0]),
+      new Uint8Array([0]),
+      nul,
+      nul,
       textBytes
     ]);
 
@@ -471,7 +533,6 @@
     };
   }
 
-  // Comma-separated filter tokens (OR logic)
   function getFilterTokens(panel) {
     const raw = (panel.querySelector("#grok-arch-filter")?.value || "").trim().toLowerCase();
     if (!raw) return [];
@@ -496,7 +557,6 @@
            rect.left <= (window.innerWidth || document.documentElement.clientWidth);
   }
 
-  // Capture media currently visible on screen (helps when no removedNodes yet)
   function captureVisibleMedia() {
     const els = document.querySelectorAll("img, video");
     for (const el of els) {
@@ -504,7 +564,7 @@
       if (!isElementVisibleInViewport(container)) continue;
 
       const urls = extractUrlsFromNode(container);
-      for (const u of urls) addUrl(u);
+      for (const u of urls) addUrl(u, container);
 
       collectDataImagesFromNode(container);
     }
@@ -568,30 +628,104 @@
       });
   }
 
-  async function buildZipFromCachedDataImages({ onProgress }) {
+  async function fetchMediaBlob(url) {
+    const res = await fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      mode: 'cors',
+      cache: 'default',
+      referrer: location.href,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+      headers: {
+        'Accept': 'video/*,application/octet-stream,*/*;q=0.8'
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);
+    }
+
+    return res.blob();
+  }
+
+  function fetchMediaBlobXHR(url) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'blob';
+      xhr.withCredentials = true;
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300 && xhr.response) {
+          resolve(xhr.response);
+        } else {
+          reject(new Error(`XHR failed: ${xhr.status} ${xhr.statusText || ''}`));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('XHR network error'));
+      xhr.onabort = () => reject(new Error('XHR aborted'));
+
+      try {
+        xhr.send();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function fetchVideoBlobWithFallback(url) {
+    try {
+      return await fetchMediaBlob(url);
+    } catch (err1) {
+      console.warn('[grok.js][video] fetch failed, trying XHR fallback:', url, err1);
+      return fetchMediaBlobXHR(url);
+    }
+  }
+
+  async function buildZipFromCapturedMedia({ onProgress }) {
     const JSZip = window.JSZip;
     if (!JSZip) throw new Error("JSZip not loaded");
 
     const zip = new JSZip();
 
-    const entries = [...dataImageCache.values()]
-      .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const imageEntries = [...dataImageCache.values()]
+      .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+      .map((entry, idx) => ({ kind: 'image', idx, entry }));
+
+    const videoEntries = [...videoCache.values()]
+      .sort((a, b) => (a.ts || 0) - (b.ts || 0))
+      .map((entry, idx) => ({ kind: 'video', idx, entry }));
+
+    const entries = [...imageEntries, ...videoEntries]
+      .sort((a, b) => ((a.entry.ts || 0) - (b.entry.ts || 0)));
 
     const total = entries.length;
 
     for (let i = 0; i < total; i++) {
-      const { dataUrl, parameters } = entries[i];
-      const pngBlob = await convertDataImageToPngWithParameters(dataUrl, parameters || "");
-      const name = `image_${String(i + 1).padStart(4, "0")}.png`;
-      zip.file(name, pngBlob);
+      const current = entries[i];
+
+      if (current.kind === 'image') {
+        const { dataUrl, parameters } = current.entry;
+        const pngBlob = await convertDataImageToPngWithParameters(dataUrl, parameters || '');
+        const name = `image_${String(current.idx + 1).padStart(4, '0')}.png`;
+        zip.file(name, pngBlob);
+      } else {
+        const { url } = current.entry;
+        const blob = await fetchVideoBlobWithFallback(url);
+        const extMatch = url.match(/\.([a-z0-9]+)(?:\?|#|$)/i);
+        const ext = (extMatch?.[1] || 'mp4').toLowerCase();
+        const name = `video_${String(current.idx + 1).padStart(4, '0')}.${ext}`;
+        zip.file(name, blob);
+      }
 
       if (onProgress) onProgress(i + 1, total);
 
-      if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      if (i % 3 === 0) await new Promise(r => setTimeout(r, 0));
     }
 
-    const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-    return { blob, count: total };
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    return { blob, count: total, title: getShortTitleFromCaches() };
   }
 
   function ensurePanel() {
@@ -635,7 +769,7 @@
           <button id="grok-arch-export" style="cursor:pointer;">Export</button>
           <button id="grok-arch-copy" style="cursor:pointer;">Copy URLs</button>
           <button id="grok-arch-rescan" style="cursor:pointer;">Rescan</button>
-          <button id="grok-arch-zip" style="cursor:pointer;">ZIP (PNG+Parameters)</button>
+          <button id="grok-arch-zip" style="cursor:pointer;">ZIP (media)</button>
           <button id="grok-arch-top" style="cursor:pointer;">Top</button>
           <button id="grok-arch-scroll" style="cursor:pointer;">Auto-scroll</button>
           <button id="grok-arch-clear" style="cursor:pointer;">Clear</button>
@@ -726,6 +860,7 @@
       persist();
 
       dataImageCache.clear();
+      videoCache.clear();
       dataImageCountLastUI = -1;
       updateZipButtonCounter(true);
 
@@ -779,7 +914,7 @@
         btn.disabled = true;
         btn.textContent = "Scanning…";
 
-        const { blob, count } = await buildZipFromCachedDataImages({
+        const { blob, count, title } = await buildZipFromCapturedMedia({
           onProgress: (done, total) => {
             btn.textContent = `ZIP ${done}/${total}`;
           }
@@ -792,7 +927,7 @@
         }
 
         btn.textContent = "Downloading…";
-        downloadBlob(blob, `grok-imagine-png-parameters-${tsStamp()}.zip`);
+        downloadBlob(blob, buildZipFilename(title));
 
         btn.textContent = `ZIP done (${count})`;
         setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1400);
@@ -889,7 +1024,7 @@
           const scope = el.closest?.("article, section, div") || el;
 
           const urls = extractUrlsFromNode(scope);
-          for (const u of urls) if (addUrl(u)) changed = true;
+          for (const u of urls) if (addUrl(u, scope)) changed = true;
 
           collectDataImagesFromNode(scope);
           continue;
@@ -899,7 +1034,7 @@
           if (!node || node.nodeType !== 1) continue;
 
           const urls = extractUrlsFromNode(node);
-          for (const u of urls) if (addUrl(u)) changed = true;
+          for (const u of urls) if (addUrl(u, node)) changed = true;
 
           collectDataImagesFromNode(node);
         }
@@ -908,7 +1043,7 @@
           if (!node || node.nodeType !== 1) continue;
 
           const urls = extractUrlsFromNode(node);
-          for (const u of urls) if (addUrl(u)) changed = true;
+          for (const u of urls) if (addUrl(u, node)) changed = true;
 
           collectDataImagesFromNode(node);
         }
